@@ -1,3 +1,7 @@
-.venv
+venv
 node_modules
 dist
+__pycache__
+*.mp4
+*.env
+*.DS_Store
