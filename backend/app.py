@@ -54,19 +54,6 @@ class VideoResponse(BaseModel):
     meta: Dict[str, Any]
     votes: Dict[str, int]
 
-# ---------------- Base record initializer ----------------
-def ensure_base(reel_id: str, source_url: Optional[str] = None) -> None:
-    base_data = {
-        "ai": 0,
-        "not_ai": 0,
-        "created_ts": str(int(time.time() * 1000))
-    }
-    if source_url:
-        base_data["source_url"] = source_url
-
-    # Use JSON.SET to store the base data as a JSON object
-    r.json().set(k_reel(reel_id), '$', base_data)
-
 def read_reel(reel_id: str) -> dict:
     # Use JSON.GET to retrieve the JSON object
     reel_data = r.json().get(k_reel(reel_id))
@@ -106,3 +93,22 @@ def post_reel(reel_id: str, req: EnqueueVideoLinkRequest):
     # Enqueue the job
     msg_id = enqueue_job("reel_link", req.source_url)
     return {"ok": True, "queued": True, "msg_id": msg_id}
+
+# ---------------- Updated Routes ----------------
+@app.post("/reels/{reel_id}/vote")
+def vote_reel(reel_id: str, req: VoteRequest):
+    # Retrieve the existing reel data
+    reel_data = read_reel(reel_id)
+
+    # Add the user's response to the user_responses column
+    user_responses = reel_data.get("user_responses", [])
+    user_responses.append({
+        "label": req.label,
+        "timestamp": str(int(time.time() * 1000))
+    })
+
+    # Update the reel data with the new user response
+    reel_data["user_responses"] = user_responses
+    r.json().set(k_reel(reel_id), '$', reel_data)
+
+    return {"ok": True, "message": "User response recorded."}
