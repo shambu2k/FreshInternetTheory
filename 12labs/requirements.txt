@@ -1,4 +1,4 @@
-yt-dlp>=2026.2.4
-twelvelabs>=1.2.0
-python-dotenv>=1.0.1
-valkey>=6.1.1
+yt-dlp==2026.2.4
+twelvelabs==1.2.0
+python-dotenv==1.0.1
+valkey==6.1.1
