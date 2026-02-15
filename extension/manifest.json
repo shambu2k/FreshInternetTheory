@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Fresh Internet Theory - Reels Rater",
+  "description": "Rate Facebook Reels as AI or not AI and sync votes with the backend API.",
+  "version": "0.1.0",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://www.facebook.com/*",
+    "http://localhost:8000/*",
+    "http://127.0.0.1:8000/*",
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "service_worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://www.facebook.com/reel/*",
+        "*://www.facebook.com/reels/*"
+      ],
+      "js": [
+        "content_script.js"
+      ],
+      "run_at": "document_start"
+    }
+  ],
+  "options_page": "options.html"
+}

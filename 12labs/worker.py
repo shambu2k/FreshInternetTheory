@@ -64,6 +64,8 @@ Classify evidence into these specific categories:
 Return JSON with keys: is_likely_ai_generated (bool), confidence (0-100), key_evidence (list of objects with category, timestamp, description).
 """.strip()
 
+SCHEMA_VERSION = 2
+
 
 @dataclass(frozen=True)
 class WorkerConfig:
@@ -71,6 +73,7 @@ class WorkerConfig:
     queue_name: str
     queue_type: str
     stream_group: str
+    stream_dead_letter_name: str
     stream_consumer: str
     stream_block_ms: int
     socket_timeout_seconds: float
@@ -86,6 +89,7 @@ def load_worker_config() -> WorkerConfig:
     queue_name = os.getenv("WORKER_QUEUE_NAME", "reel_jobs")
     queue_type = os.getenv("WORKER_QUEUE_TYPE", "stream")
     stream_group = os.getenv("WORKER_STREAM_GROUP", "g_reel")
+    stream_dead_letter_name = os.getenv("WORKER_STREAM_DLQ_NAME", f"{queue_name}_dlq")
     stream_consumer = os.getenv("WORKER_STREAM_CONSUMER", "worker-1")
     stream_block_ms = int(os.getenv("WORKER_STREAM_BLOCK_MS", "5000"))
     default_socket_timeout = max(30.0, (stream_block_ms / 1000.0) + 10.0)
@@ -93,12 +97,13 @@ def load_worker_config() -> WorkerConfig:
     poll_interval = int(os.getenv("WORKER_POLL_INTERVAL_SECONDS", "5"))
     downloads_dir = Path(os.getenv("WORKER_DOWNLOADS_DIR", Path(__file__).resolve().parent / "downloads"))
     prompt = os.getenv("WORKER_AI_DETECTION_PROMPT", DEFAULT_AI_DETECTION_PROMPT)
-    datastore_key_prefix = os.getenv("WORKER_DATASTORE_KEY_PREFIX", "")
+    datastore_key_prefix = os.getenv("WORKER_DATASTORE_KEY_PREFIX", "reel:")
     return WorkerConfig(
         valkey_url=valkey_url,
         queue_name=queue_name,
         queue_type=queue_type,
         stream_group=stream_group,
+        stream_dead_letter_name=stream_dead_letter_name,
         stream_consumer=stream_consumer,
         stream_block_ms=stream_block_ms,
         socket_timeout_seconds=socket_timeout_seconds,
@@ -132,6 +137,10 @@ def parse_stream_fields(fields: dict[str, Any]) -> dict[str, Any]:
     payload: dict[str, Any] = {"reel_url": reel_url}
     if "job_id" in fields:
         payload["job_id"] = fields["job_id"]
+    elif "request_id" in fields:
+        payload["job_id"] = fields["request_id"]
+    if "reel_id" in fields:
+        payload["reel_id"] = fields["reel_id"]
     return payload
 
 
@@ -151,6 +160,145 @@ def analyze_video_for_ai(client: Any, video_id: str, prompt: str) -> dict[str, A
     return {"raw_analysis": str(response_data)}
 
 
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _coerce_non_negative_int(value: Any, default: int = 0) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def build_default_reel_document(reel_id: str, source_url: str | None = None) -> dict[str, Any]:
+    ts = now_ms()
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "reel_id": reel_id,
+        "source_url": source_url,
+        "post_count": 0,
+        "votes": {"ai": 0, "not_ai": 0, "total": 0},
+        "user_votes": [],
+        "analysis": {
+            "status": "not_started",
+            "twelvelabs": None,
+            "indexing": None,
+            "last_job_id": None,
+            "last_error": None,
+            "processed_at_epoch": None,
+            "updated_at_ms": None,
+        },
+        "timestamps": {
+            "created_at_ms": ts,
+            "updated_at_ms": ts,
+            "last_posted_at_ms": None,
+            "last_voted_at_ms": None,
+            "last_analyzed_at_ms": None,
+        },
+        # Legacy aliases kept for compatibility.
+        "12labs_ai_analysis": None,
+        "user_responses": [],
+        "user_analysis": {"votes": [], "counts": {"ai": 0, "not_ai": 0, "total": 0}},
+    }
+
+
+def normalize_reel_document(
+    reel_id: str,
+    raw_doc: Any,
+    *,
+    source_url: str | None = None,
+) -> dict[str, Any]:
+    doc = raw_doc.copy() if isinstance(raw_doc, dict) else {}
+    defaults = build_default_reel_document(reel_id, source_url=source_url)
+
+    doc["schema_version"] = SCHEMA_VERSION
+    doc["reel_id"] = reel_id
+    doc["source_url"] = source_url if source_url else doc.get("source_url")
+    doc["post_count"] = _coerce_non_negative_int(doc.get("post_count"), 0)
+
+    user_votes_raw = doc.get("user_votes")
+    if not isinstance(user_votes_raw, list):
+        user_votes_raw = doc.get("user_responses", [])
+    if not isinstance(user_votes_raw, list):
+        user_votes_raw = []
+
+    normalized_votes: list[dict[str, Any]] = []
+    for item in user_votes_raw:
+        if not isinstance(item, dict):
+            continue
+        label = item.get("label")
+        if label not in ("ai", "not_ai"):
+            continue
+        vote_timestamp = _coerce_non_negative_int(
+            item.get("timestamp_ms", item.get("timestamp")),
+            now_ms(),
+        )
+        vote_source_url = item.get("source_url")
+        normalized_vote: dict[str, Any] = {"label": label, "timestamp_ms": vote_timestamp}
+        if isinstance(vote_source_url, str) and vote_source_url:
+            normalized_vote["source_url"] = vote_source_url
+        normalized_votes.append(normalized_vote)
+
+    votes = doc.get("votes")
+    if not isinstance(votes, dict):
+        votes = {}
+    inferred_ai_votes = sum(1 for vote in normalized_votes if vote["label"] == "ai")
+    inferred_not_ai_votes = sum(1 for vote in normalized_votes if vote["label"] == "not_ai")
+    ai_votes = max(_coerce_non_negative_int(votes.get("ai"), 0), inferred_ai_votes)
+    not_ai_votes = max(_coerce_non_negative_int(votes.get("not_ai"), 0), inferred_not_ai_votes)
+    total_votes = max(_coerce_non_negative_int(votes.get("total"), 0), ai_votes + not_ai_votes)
+
+    analysis = doc.get("analysis")
+    if not isinstance(analysis, dict):
+        analysis = {}
+    if "twelvelabs" not in analysis and "12labs_ai_analysis" in doc:
+        analysis["twelvelabs"] = doc.get("12labs_ai_analysis")
+    status = analysis.get("status")
+    if status not in {"not_started", "queued", "completed", "failed"}:
+        status = "completed" if analysis.get("twelvelabs") else "not_started"
+    analysis = {
+        "status": status,
+        "twelvelabs": analysis.get("twelvelabs"),
+        "indexing": analysis.get("indexing"),
+        "last_job_id": analysis.get("last_job_id"),
+        "last_error": analysis.get("last_error"),
+        "processed_at_epoch": analysis.get("processed_at_epoch"),
+        "updated_at_ms": analysis.get("updated_at_ms"),
+    }
+
+    timestamps = doc.get("timestamps")
+    if not isinstance(timestamps, dict):
+        timestamps = {}
+    created_at_ms = _coerce_non_negative_int(
+        timestamps.get("created_at_ms"),
+        defaults["timestamps"]["created_at_ms"],
+    )
+    timestamps = {
+        "created_at_ms": created_at_ms,
+        "updated_at_ms": _coerce_non_negative_int(
+            timestamps.get("updated_at_ms"),
+            created_at_ms,
+        ),
+        "last_posted_at_ms": timestamps.get("last_posted_at_ms"),
+        "last_voted_at_ms": timestamps.get("last_voted_at_ms"),
+        "last_analyzed_at_ms": timestamps.get("last_analyzed_at_ms"),
+    }
+
+    doc["votes"] = {"ai": ai_votes, "not_ai": not_ai_votes, "total": total_votes}
+    doc["user_votes"] = normalized_votes
+    doc["analysis"] = analysis
+    doc["timestamps"] = timestamps
+
+    # Legacy aliases kept in sync with canonical fields.
+    doc["12labs_ai_analysis"] = analysis["twelvelabs"]
+    doc["user_responses"] = normalized_votes
+    doc["user_analysis"] = {"votes": normalized_votes, "counts": doc["votes"]}
+
+    return doc
+
+
 def save_result_to_datastore(
     datastore_client: valkey.Valkey,
     result: dict[str, Any],
@@ -158,12 +306,49 @@ def save_result_to_datastore(
 ) -> None:
     reel_id = result.get("reel_id")
     analysis = result.get("analysis")
+    indexing = result.get("indexing")
+    processed_at_epoch = result.get("processed_at_epoch")
+    reel_url = result.get("reel_url")
+    job_id = result.get("job_id")
     if not reel_id:
         raise ValueError("Cannot persist result without reel_id")
 
     datastore_key = f"{key_prefix}{reel_id}"
-    datastore_value = json.dumps(analysis, ensure_ascii=False)
-    datastore_client.set(datastore_key, datastore_value)
+    current_value = datastore_client.get(datastore_key)
+    if not current_value and key_prefix:
+        # Backward compatibility for older worker versions that used the raw reel_id key.
+        current_value = datastore_client.get(reel_id)
+
+    if current_value:
+        try:
+            current_dict = json.loads(current_value)
+        except json.JSONDecodeError:
+            current_dict = {}
+    else:
+        current_dict = {}
+
+    current_dict = normalize_reel_document(
+        reel_id=reel_id,
+        raw_doc=current_dict,
+        source_url=reel_url,
+    )
+
+    event_ts = now_ms()
+    current_dict["analysis"]["status"] = "completed"
+    current_dict["analysis"]["twelvelabs"] = analysis
+    current_dict["analysis"]["indexing"] = indexing
+    if job_id:
+        current_dict["analysis"]["last_job_id"] = job_id
+    current_dict["analysis"]["last_error"] = None
+    current_dict["analysis"]["processed_at_epoch"] = processed_at_epoch
+    current_dict["analysis"]["updated_at_ms"] = event_ts
+    current_dict["timestamps"]["last_analyzed_at_ms"] = event_ts
+    current_dict["timestamps"]["updated_at_ms"] = event_ts
+
+    # Legacy alias for existing readers.
+    current_dict["12labs_ai_analysis"] = analysis
+
+    datastore_client.set(datastore_key, json.dumps(current_dict, ensure_ascii=False))
     print(f"Saved analysis to datastore key={datastore_key}")
 
 
@@ -175,6 +360,9 @@ def process_message(
 ) -> dict[str, Any]:
     reel_url = payload["reel_url"]
     job_id = payload.get("job_id")
+    reel_id = payload.get("reel_id")
+    if not reel_id:
+        reel_id = extract_reel_id(reel_url)
 
     downloaded_path = download_facebook_reel(reel_url, output_dir=config.downloads_dir)
     indexing_result = upload_and_index_video(downloaded_path)
@@ -187,7 +375,7 @@ def process_message(
     result = {
         "job_id": job_id,
         "reel_url": reel_url,
-        "reel_id": extract_reel_id(reel_url),
+        "reel_id": reel_id,
         "downloaded_file": str(downloaded_path),
         "indexing": asdict(indexing_result),
         "analysis": analysis_result,
@@ -256,7 +444,38 @@ def run_worker() -> None:
                         valkey_client.xack(stream_name, config.stream_group, message_id)
                         print(json.dumps({"status": "ok", "result": result, "stream_id": message_id}, ensure_ascii=False))
                     except Exception as exc:
-                        print(json.dumps({"status": "error", "message": str(exc), "stream_id": message_id, "fields": fields}, ensure_ascii=False))
+                        print(
+                            json.dumps(
+                                {
+                                    "status": "error",
+                                    "message": str(exc),
+                                    "stream_id": message_id,
+                                    "fields": fields,
+                                },
+                                ensure_ascii=False,
+                            )
+                        )
+                        dlq_event = {
+                            "stream_id": message_id,
+                            "error": str(exc),
+                            "fields": json.dumps(fields, ensure_ascii=False),
+                            "ts": str(now_ms()),
+                        }
+                        try:
+                            valkey_client.xadd(config.stream_dead_letter_name, dlq_event)
+                        except Exception as dlq_exc:
+                            print(
+                                json.dumps(
+                                    {
+                                        "status": "error",
+                                        "message": f"Failed to write to DLQ: {dlq_exc}",
+                                        "stream_id": message_id,
+                                        "dlq_stream": config.stream_dead_letter_name,
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            )
+                        valkey_client.xack(stream_name, config.stream_group, message_id)
         else:
             item = valkey_client.blpop(config.queue_name, timeout=0)
             if not item:

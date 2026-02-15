@@ -13,7 +13,7 @@ def extract_reel_id(url: str) -> str:
 	parsed = urlparse(url)
 	path = parsed.path.rstrip("/")
 
-	match = re.search(r"/reel/(\d+)", path)
+	match = re.search(r"/reels?/(\d+)", path)
 	if match:
 		return match.group(1)
 
