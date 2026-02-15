@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
-VALKEY_URL = os.getenv("VALKEY_URL")
+VALKEY_URL = os.getenv("VALKEY_URL", "redis://localhost:6379/0")
 
 r = redis.Redis.from_url(VALKEY_URL, decode_responses=True)
 
