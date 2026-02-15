@@ -1,4 +1,5 @@
 const STORAGE_KEY_BACKEND_BASE_URL = "backendBaseUrl";
+const STORAGE_KEY_AUTOSKIP_AI = "autoSkipAiReels";
 const DEFAULT_BASE_URL = "http://localhost:8000";
 
 function normalizeBaseUrl(raw) {
@@ -18,35 +19,49 @@ function normalizeBaseUrl(raw) {
 function setStatus(message, isError) {
   const status = document.getElementById("status");
   status.textContent = message;
-  status.style.color = isError ? "#b00020" : "#137333";
+  status.style.color = isError ? "#ff9a93" : "#84daba";
 }
 
 function loadOptions() {
   chrome.storage.sync.get(
-    { [STORAGE_KEY_BACKEND_BASE_URL]: DEFAULT_BASE_URL },
+    {
+      [STORAGE_KEY_BACKEND_BASE_URL]: DEFAULT_BASE_URL,
+      [STORAGE_KEY_AUTOSKIP_AI]: false
+    },
     (items) => {
-      const input = document.getElementById("backend-url");
-      input.value = items[STORAGE_KEY_BACKEND_BASE_URL] || DEFAULT_BASE_URL;
+      const urlInput = document.getElementById("backend-url");
+      const autoSkipInput = document.getElementById("auto-skip-ai");
+
+      urlInput.value = items[STORAGE_KEY_BACKEND_BASE_URL] || DEFAULT_BASE_URL;
+      autoSkipInput.checked = Boolean(items[STORAGE_KEY_AUTOSKIP_AI]);
     }
   );
 }
 
 function saveOptions() {
-  const input = document.getElementById("backend-url");
-  const normalized = normalizeBaseUrl(input.value);
+  const urlInput = document.getElementById("backend-url");
+  const autoSkipInput = document.getElementById("auto-skip-ai");
+
+  const normalized = normalizeBaseUrl(urlInput.value);
   if (!normalized) {
     setStatus("Enter a valid URL including protocol (http/https).", true);
     return;
   }
 
-  chrome.storage.sync.set({ [STORAGE_KEY_BACKEND_BASE_URL]: normalized }, () => {
-    if (chrome.runtime.lastError) {
-      setStatus(chrome.runtime.lastError.message || "Failed to save URL.", true);
-      return;
+  chrome.storage.sync.set(
+    {
+      [STORAGE_KEY_BACKEND_BASE_URL]: normalized,
+      [STORAGE_KEY_AUTOSKIP_AI]: Boolean(autoSkipInput.checked)
+    },
+    () => {
+      if (chrome.runtime.lastError) {
+        setStatus(chrome.runtime.lastError.message || "Failed to save settings.", true);
+        return;
+      }
+      urlInput.value = normalized;
+      setStatus("Settings saved.", false);
     }
-    input.value = normalized;
-    setStatus("Saved.", false);
-  });
+  );
 }
 
 document.addEventListener("DOMContentLoaded", () => {

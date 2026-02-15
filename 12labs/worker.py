@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import inspect
+import math
 import os
 import time
 from dataclasses import asdict, dataclass
@@ -81,6 +83,9 @@ class WorkerConfig:
     downloads_dir: Path
     analysis_prompt: str
     datastore_key_prefix: str
+    similarity_reuse_enabled: bool
+    similarity_reuse_threshold: float
+    similarity_candidate_limit: int
 
 
 def load_worker_config() -> WorkerConfig:
@@ -98,6 +103,15 @@ def load_worker_config() -> WorkerConfig:
     downloads_dir = Path(os.getenv("WORKER_DOWNLOADS_DIR", Path(__file__).resolve().parent / "downloads"))
     prompt = os.getenv("WORKER_AI_DETECTION_PROMPT", DEFAULT_AI_DETECTION_PROMPT)
     datastore_key_prefix = os.getenv("WORKER_DATASTORE_KEY_PREFIX", "reel:")
+    similarity_reuse_enabled = os.getenv("WORKER_SIMILARITY_REUSE_ENABLED", "true").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    similarity_reuse_threshold = float(os.getenv("WORKER_SIMILARITY_REUSE_THRESHOLD", "0.92"))
+    similarity_reuse_threshold = max(0.0, min(1.0, similarity_reuse_threshold))
+    similarity_candidate_limit = int(os.getenv("WORKER_SIMILARITY_CANDIDATE_LIMIT", "1000"))
     return WorkerConfig(
         valkey_url=valkey_url,
         queue_name=queue_name,
@@ -111,6 +125,9 @@ def load_worker_config() -> WorkerConfig:
         downloads_dir=downloads_dir,
         analysis_prompt=prompt,
         datastore_key_prefix=datastore_key_prefix,
+        similarity_reuse_enabled=similarity_reuse_enabled,
+        similarity_reuse_threshold=similarity_reuse_threshold,
+        similarity_candidate_limit=similarity_candidate_limit,
     )
 
 
@@ -160,6 +177,281 @@ def analyze_video_for_ai(client: Any, video_id: str, prompt: str) -> dict[str, A
     return {"raw_analysis": str(response_data)}
 
 
+def _coerce_float_vector(value: Any) -> list[float] | None:
+    if not isinstance(value, list) or not value:
+        return None
+    vector: list[float] = []
+    for element in value:
+        if isinstance(element, (int, float)):
+            vector.append(float(element))
+            continue
+        return None
+    return vector
+
+
+def _extract_segment_embedding_vector(segment: Any) -> list[float] | None:
+    # Supports both object-based and dict-based SDK response shapes.
+    if isinstance(segment, dict):
+        candidates = (
+            segment.get("embeddings_float"),
+            segment.get("embedding_float"),
+            segment.get("embedding"),
+            segment.get("vector"),
+            segment.get("embeddings"),
+        )
+    else:
+        candidates = (
+            getattr(segment, "embeddings_float", None),
+            getattr(segment, "embedding_float", None),
+            getattr(segment, "embedding", None),
+            getattr(segment, "vector", None),
+            getattr(segment, "embeddings", None),
+        )
+
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            for nested_key in ("float", "embeddings_float", "vector", "values"):
+                nested_value = candidate.get(nested_key)
+                vector = _coerce_float_vector(nested_value)
+                if vector:
+                    return vector
+        vector = _coerce_float_vector(candidate)
+        if vector:
+            return vector
+    return None
+
+
+def _extract_video_embedding_segments(indexed_asset_details: Any) -> list[Any]:
+    # Newer SDK shape.
+    video_embedding = getattr(indexed_asset_details, "video_embedding", None)
+    if video_embedding is None and isinstance(indexed_asset_details, dict):
+        video_embedding = indexed_asset_details.get("video_embedding")
+    if video_embedding is not None:
+        segments = getattr(video_embedding, "segments", None)
+        if segments is None and isinstance(video_embedding, dict):
+            segments = video_embedding.get("segments")
+        if isinstance(segments, list):
+            return segments
+
+    # Older SDK shape.
+    embedding = getattr(indexed_asset_details, "embedding", None)
+    if embedding is None and isinstance(indexed_asset_details, dict):
+        embedding = indexed_asset_details.get("embedding")
+    if embedding is not None:
+        nested_video_embedding = getattr(embedding, "video_embedding", None)
+        if nested_video_embedding is None and isinstance(embedding, dict):
+            nested_video_embedding = embedding.get("video_embedding")
+        if nested_video_embedding is not None:
+            segments = getattr(nested_video_embedding, "segments", None)
+            if segments is None and isinstance(nested_video_embedding, dict):
+                segments = nested_video_embedding.get("segments")
+            if isinstance(segments, list):
+                return segments
+
+    return []
+
+
+def _vector_mean(vectors: list[list[float]]) -> list[float] | None:
+    if not vectors:
+        return None
+    dimension = len(vectors[0])
+    if dimension == 0:
+        return None
+    valid_vectors = [vector for vector in vectors if len(vector) == dimension]
+    if not valid_vectors:
+        return None
+    totals = [0.0] * dimension
+    for vector in valid_vectors:
+        for index, value in enumerate(vector):
+            totals[index] += value
+    count = float(len(valid_vectors))
+    return [value / count for value in totals]
+
+
+def _normalize_vector(vector: list[float]) -> list[float] | None:
+    squared_sum = sum(value * value for value in vector)
+    if squared_sum <= 0.0:
+        return None
+    norm = math.sqrt(squared_sum)
+    return [value / norm for value in vector]
+
+
+def _dot_product(a: list[float], b: list[float]) -> float:
+    return sum(left * right for left, right in zip(a, b))
+
+
+def _parse_reel_doc(raw_doc: str) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(raw_doc)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def compute_indexed_asset_embedding_signature(
+    client: Any,
+    index_id: str,
+    indexed_asset_id: str,
+) -> dict[str, Any] | None:
+    retrieve_fn = client.indexes.indexed_assets.retrieve
+    accepted_kwargs: set[str] = set()
+    has_var_keyword = False
+    try:
+        signature = inspect.signature(retrieve_fn)
+        accepted_kwargs = set(signature.parameters.keys())
+        has_var_keyword = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+    except (TypeError, ValueError):
+        # Some SDK/client wrappers may not expose signatures.
+        accepted_kwargs = set()
+        has_var_keyword = True
+
+    supports_embedding_option = (
+        "embedding_option" in accepted_kwargs
+        or has_var_keyword
+    )
+    supports_embed = (
+        "embed" in accepted_kwargs
+        or has_var_keyword
+    )
+
+    attempts: list[tuple[str, dict[str, Any]]] = []
+    if supports_embedding_option:
+        # "visual-text" is not supported on many indexes; probe only commonly allowed modes.
+        for option in ("visual", "audio", "transcription"):
+            # Keep both payload shapes for SDK/API compatibility.
+            attempts.append((f"{option}-list", {"embedding_option": [option]}))
+            attempts.append((f"{option}-str", {"embedding_option": option}))
+    if supports_embed:
+        attempts.append(("legacy-embed", {"embed": True}))
+    attempts.append(("default", {}))
+
+    last_error: Exception | None = None
+
+    for embedding_option_name, kwargs in attempts:
+        try:
+            details = retrieve_fn(
+                index_id=index_id,
+                indexed_asset_id=indexed_asset_id,
+                **kwargs,
+            )
+        except TypeError as exc:
+            # Avoid noisy failures when running across mixed SDK versions.
+            if "unexpected keyword argument" in str(exc):
+                continue
+            last_error = exc
+            continue
+        except Exception as exc:
+            error_text = str(exc).lower()
+            # Unsupported embedding options should not fail the whole job.
+            if "parameter_invalid" in error_text and "embedding_option" in error_text:
+                continue
+            last_error = exc
+            continue
+
+        segments = _extract_video_embedding_segments(details)
+        vectors: list[list[float]] = []
+        for segment in segments:
+            vector = _extract_segment_embedding_vector(segment)
+            if vector:
+                vectors.append(vector)
+        pooled = _vector_mean(vectors)
+        if pooled is None:
+            continue
+        normalized = _normalize_vector(pooled)
+        if normalized is None:
+            continue
+        return {
+            "embedding_option": embedding_option_name,
+            "dimension": len(normalized),
+            "segment_count": len(vectors),
+            "vector": normalized,
+        }
+
+    if last_error:
+        print(f"Embedding signature retrieval failed for {indexed_asset_id}: {last_error}")
+    return None
+
+
+def _extract_analysis_vector_from_reel_doc(doc: dict[str, Any]) -> list[float] | None:
+    analysis = doc.get("analysis")
+    if not isinstance(analysis, dict):
+        return None
+    embedding_signature = analysis.get("embedding_signature")
+    if not isinstance(embedding_signature, dict):
+        return None
+    return _coerce_float_vector(embedding_signature.get("vector"))
+
+
+def find_similar_reel_in_datastore(
+    datastore_client: valkey.Valkey,
+    *,
+    key_prefix: str,
+    current_reel_id: str,
+    current_index_id: str | None,
+    current_vector: list[float],
+    similarity_threshold: float,
+    candidate_limit: int,
+) -> dict[str, Any] | None:
+    pattern = f"{key_prefix}*" if key_prefix else "*"
+    current_key = f"{key_prefix}{current_reel_id}"
+    best_match: dict[str, Any] | None = None
+    inspected = 0
+
+    for key in datastore_client.scan_iter(match=pattern, count=200):
+        if inspected >= candidate_limit:
+            break
+        if key == current_key:
+            continue
+        try:
+            raw_doc = datastore_client.get(key)
+        except valkey.exceptions.ResponseError:
+            continue
+        if not raw_doc:
+            continue
+        doc = _parse_reel_doc(raw_doc)
+        if doc is None:
+            continue
+        doc = normalize_reel_document(reel_id=doc.get("reel_id") or key.replace(key_prefix, "", 1), raw_doc=doc)
+
+        candidate_analysis = doc.get("analysis")
+        if not isinstance(candidate_analysis, dict):
+            continue
+        if not candidate_analysis.get("twelvelabs"):
+            continue
+        candidate_indexing = candidate_analysis.get("indexing")
+        candidate_index_id = None
+        if isinstance(candidate_indexing, dict):
+            candidate_index_id = candidate_indexing.get("index_id")
+        if current_index_id and candidate_index_id and current_index_id != candidate_index_id:
+            continue
+
+        candidate_vector = _extract_analysis_vector_from_reel_doc(doc)
+        if not candidate_vector:
+            continue
+        if len(candidate_vector) != len(current_vector):
+            continue
+
+        inspected += 1
+        similarity = _dot_product(current_vector, candidate_vector)
+        if best_match is None or similarity > best_match["similarity_score"]:
+            best_match = {
+                "reel_id": doc.get("reel_id"),
+                "analysis": candidate_analysis.get("twelvelabs"),
+                "indexing": candidate_analysis.get("indexing"),
+                "similarity_score": similarity,
+                "source_key": key,
+            }
+
+    if not best_match:
+        return None
+    if best_match["similarity_score"] < similarity_threshold:
+        return None
+    return best_match
+
+
 def now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -185,6 +477,8 @@ def build_default_reel_document(reel_id: str, source_url: str | None = None) -> 
             "status": "not_started",
             "twelvelabs": None,
             "indexing": None,
+            "embedding_signature": None,
+            "similarity_match": None,
             "last_job_id": None,
             "last_error": None,
             "processed_at_epoch": None,
@@ -262,6 +556,8 @@ def normalize_reel_document(
         "status": status,
         "twelvelabs": analysis.get("twelvelabs"),
         "indexing": analysis.get("indexing"),
+        "embedding_signature": analysis.get("embedding_signature"),
+        "similarity_match": analysis.get("similarity_match"),
         "last_job_id": analysis.get("last_job_id"),
         "last_error": analysis.get("last_error"),
         "processed_at_epoch": analysis.get("processed_at_epoch"),
@@ -310,6 +606,8 @@ def save_result_to_datastore(
     processed_at_epoch = result.get("processed_at_epoch")
     reel_url = result.get("reel_url")
     job_id = result.get("job_id")
+    embedding_signature = result.get("embedding_signature")
+    similarity_match = result.get("similarity_match")
     if not reel_id:
         raise ValueError("Cannot persist result without reel_id")
 
@@ -337,6 +635,8 @@ def save_result_to_datastore(
     current_dict["analysis"]["status"] = "completed"
     current_dict["analysis"]["twelvelabs"] = analysis
     current_dict["analysis"]["indexing"] = indexing
+    current_dict["analysis"]["embedding_signature"] = embedding_signature
+    current_dict["analysis"]["similarity_match"] = similarity_match
     if job_id:
         current_dict["analysis"]["last_job_id"] = job_id
     current_dict["analysis"]["last_error"] = None
@@ -366,11 +666,54 @@ def process_message(
 
     downloaded_path = download_facebook_reel(reel_url, output_dir=config.downloads_dir)
     indexing_result = upload_and_index_video(downloaded_path)
-    analysis_result = analyze_video_for_ai(
+    embedding_signature = compute_indexed_asset_embedding_signature(
         client=client,
-        video_id=indexing_result.indexed_asset_id,
-        prompt=config.analysis_prompt,
+        index_id=indexing_result.index_id,
+        indexed_asset_id=indexing_result.indexed_asset_id,
     )
+
+    similar_match = None
+    if (
+        config.similarity_reuse_enabled
+        and embedding_signature
+        and isinstance(embedding_signature.get("vector"), list)
+        and len(embedding_signature["vector"]) > 0
+    ):
+        similar_match = find_similar_reel_in_datastore(
+            datastore_client=datastore_client,
+            key_prefix=config.datastore_key_prefix,
+            current_reel_id=reel_id,
+            current_index_id=indexing_result.index_id,
+            current_vector=embedding_signature["vector"],
+            similarity_threshold=config.similarity_reuse_threshold,
+            candidate_limit=config.similarity_candidate_limit,
+        )
+
+    if similar_match:
+        analysis_result = similar_match["analysis"]
+        similarity_match = {
+            "reused": True,
+            "matched_reel_id": similar_match["reel_id"],
+            "similarity_score": similar_match["similarity_score"],
+            "threshold": config.similarity_reuse_threshold,
+            "strategy": "marengo_embedding_cosine",
+            "matched_source_key": similar_match["source_key"],
+        }
+        print(
+            "Reused existing analysis from "
+            f"reel_id={similar_match['reel_id']} similarity={similar_match['similarity_score']:.4f}"
+        )
+    else:
+        analysis_result = analyze_video_for_ai(
+            client=client,
+            video_id=indexing_result.indexed_asset_id,
+            prompt=config.analysis_prompt,
+        )
+        similarity_match = {
+            "reused": False,
+            "threshold": config.similarity_reuse_threshold,
+            "strategy": "marengo_embedding_cosine",
+        }
 
     result = {
         "job_id": job_id,
@@ -379,6 +722,8 @@ def process_message(
         "downloaded_file": str(downloaded_path),
         "indexing": asdict(indexing_result),
         "analysis": analysis_result,
+        "embedding_signature": embedding_signature,
+        "similarity_match": similarity_match,
         "processed_at_epoch": int(time.time()),
     }
 

@@ -3,90 +3,200 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Reels Rater Settings</title>
+    <title>Nightwire Settings</title>
     <style>
       :root {
-        color-scheme: light;
+        font-family: 'Courier New', Courier, monospace, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        --bg-0: #0a0c10;
+        --bg-1: #121722;
+        --card: rgba(18, 22, 30, 0.94);
+        --line: rgba(190, 157, 104, 0.34);
+        --line-strong: rgba(214, 183, 129, 0.62);
+        --text: #eceff6;
+        --muted: #b0b8c6;
+        --accent: #d7ad72;
+        --accent-soft: #b88e54;
+        --ok: #7ad6b1;
+        --err: #ff8f88;
       }
+
+      * {
+        box-sizing: border-box;
+      }
+
       body {
         margin: 0;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        background: #f4f6f8;
-        color: #202124;
+        min-height: 100vh;
+        color: var(--text);
+        background:
+          radial-gradient(130% 120% at 0% 0%, #273247 0%, transparent 52%),
+          radial-gradient(120% 110% at 100% 100%, #2b2115 0%, transparent 46%),
+          linear-gradient(155deg, var(--bg-0) 0%, var(--bg-1) 100%);
       }
+
       .wrap {
-        max-width: 640px;
-        margin: 30px auto;
-        padding: 0 16px;
+        max-width: 760px;
+        margin: 34px auto;
+        padding: 0 18px;
       }
-      .card {
-        background: #fff;
-        border: 1px solid #e3e6ea;
-        border-radius: 10px;
-        padding: 18px;
+
+      .panel {
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 22px;
+        background: var(--card);
+        box-shadow: 0 20px 48px rgba(0, 0, 0, 0.45);
       }
+
       h1 {
-        font-size: 18px;
-        margin: 0 0 14px;
+        margin: 0;
+        font-size: 26px;
+        letter-spacing: 0.9px;
+        text-transform: uppercase;
       }
-      label {
-        display: block;
+
+      .subtitle {
+        margin: 6px 0 18px;
+        color: var(--muted);
         font-size: 13px;
-        margin-bottom: 8px;
-        font-weight: 600;
+        line-height: 1.5;
       }
+
+      .field {
+        margin-top: 14px;
+      }
+
+      .label {
+        display: block;
+        margin-bottom: 8px;
+        font-size: 12px;
+        letter-spacing: 0.4px;
+        text-transform: uppercase;
+        color: var(--accent);
+        font-weight: 700;
+      }
+
       input[type="url"] {
         width: 100%;
-        box-sizing: border-box;
-        border: 1px solid #ced4da;
-        border-radius: 8px;
+        border: 1px solid rgba(183, 151, 99, 0.45);
+        border-radius: 9px;
         font-size: 14px;
-        padding: 10px;
+        color: var(--text);
+        background: rgba(255, 255, 255, 0.04);
+        padding: 11px 12px;
+        outline: none;
       }
+
+      input[type="url"]:focus {
+        border-color: var(--line-strong);
+        box-shadow: 0 0 0 3px rgba(182, 145, 86, 0.14);
+      }
+
+      .toggle-wrap {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+
+      input[type="checkbox"] {
+        width: 18px;
+        height: 18px;
+        margin: 0;
+        accent-color: var(--accent-soft);
+      }
+
+      .toggle-title {
+        font-size: 14px;
+        font-weight: 600;
+      }
+
+      .hint {
+        margin: 7px 0 0;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      code {
+        background: rgba(255, 255, 255, 0.08);
+        border-radius: 4px;
+        padding: 2px 5px;
+        color: #fbf0de;
+      }
+
+      .actions {
+        margin-top: 18px;
+        display: flex;
+        align-items: center;
+        gap: 14px;
+      }
+
       button {
-        margin-top: 12px;
-        border: 0;
-        background: #1f8fff;
-        color: #fff;
-        border-radius: 8px;
-        padding: 10px 14px;
+        border: 1px solid rgba(222, 189, 136, 0.45);
+        background: linear-gradient(160deg, #4c3823, #3a2b1d);
+        color: #f7ebd6;
+        border-radius: 9px;
+        padding: 10px 15px;
         font-size: 13px;
         font-weight: 700;
+        letter-spacing: 0.3px;
         cursor: pointer;
       }
-      #status {
-        min-height: 18px;
-        margin-top: 10px;
-        font-size: 13px;
+
+      button:hover {
+        opacity: 0.94;
       }
-      .hint {
-        margin-top: 8px;
-        color: #5f6368;
+
+      #status {
+        min-height: 16px;
         font-size: 12px;
       }
-      code {
-        background: #f1f3f4;
-        border-radius: 4px;
-        padding: 1px 4px;
+
+      @media (max-width: 560px) {
+        .wrap {
+          margin: 20px auto;
+        }
+        .panel {
+          padding: 18px;
+        }
       }
     </style>
   </head>
   <body>
     <div class="wrap">
-      <div class="card">
-        <h1>Backend API Settings</h1>
-        <label for="backend-url">Backend Base URL</label>
-        <input
-          id="backend-url"
-          type="url"
-          placeholder="http://localhost:8000"
-          autocomplete="off"
-          spellcheck="false"
-        />
-        <button id="save-btn" type="button">Save</button>
-        <div id="status" role="status" aria-live="polite"></div>
-        <div class="hint">
-          Example: <code>http://localhost:8000</code>
+      <div class="panel">
+        <h1>Nightwire</h1>
+        <p class="subtitle">
+          Fresh Internet Theory settings for reel scoring, backend routing, and optional
+          auto-skip behavior.
+        </p>
+
+        <div class="field">
+          <label class="label" for="backend-url">Backend Base URL</label>
+          <input
+            id="backend-url"
+            type="url"
+            placeholder="http://localhost:8000"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <p class="hint">Example: <code>http://localhost:8000</code></p>
+        </div>
+
+        <div class="field">
+          <div class="toggle-wrap">
+            <input id="auto-skip-ai" type="checkbox" />
+            <label for="auto-skip-ai" class="toggle-title">Auto-skip likely AI reels</label>
+          </div>
+          <p class="hint">
+            When enabled, Nightwire attempts to move to the next reel whenever backend
+            verdict is <code>Likely AI</code>.
+          </p>
+        </div>
+
+        <div class="actions">
+          <button id="save-btn" type="button">Save Settings</button>
+          <div id="status" role="status" aria-live="polite"></div>
         </div>
       </div>
     </div>

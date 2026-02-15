@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Fresh Internet Theory - Reels Rater",
-  "description": "Rate Facebook Reels as AI or not AI and sync votes with the backend API.",
-  "version": "0.1.0",
+  "name": "Nightwire by Fresh Internet Theory",
+  "description": "Urban-noir Facebook Reels assistant with AI verdicts, voting, and optional auto-skip.",
+  "version": "0.2.0",
   "permissions": [
     "storage"
   ],

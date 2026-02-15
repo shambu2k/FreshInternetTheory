@@ -1,4 +1,4 @@
-# Facebook Reels Extension (MV3)
+# Nightwire (MV3)
 
 ## Files
 - `manifest.json`
@@ -16,7 +16,8 @@
 ## Configure backend
 1. Open extension options
 2. Set backend base URL (default: `http://localhost:8000`)
-3. Save
+3. (Optional) enable `Auto-skip likely AI reels`
+4. Save
 
 ## Runtime behavior
 - Matches:
@@ -30,9 +31,10 @@
   3. `GET /reels/{id}`
 - Vote buttons are client-rate-limited for 10 seconds.
 - Known reels show a backend verdict badge, for example:
-  - `Backend: Likely AI (87%)`
-  - `Backend: Likely Not AI (22%)`
+  - `Likely AI (87%)`
+  - `Likely Not AI (22%)`
 - If backend evidence is present, an expandable `Why this verdict?` section is shown with reason lines.
+- If auto-skip is enabled and verdict is `Likely AI`, the extension attempts to move to the next reel.
 - In-memory cache:
   - Unknown reels: 2 minutes
   - Known counts: 30 seconds
